@@ -6,6 +6,7 @@ import time
 
 from config.settings import AnalyzerConfig
 from ingestion.db_reader import DBReader
+from ingestion.ip_reputation import IpReputation
 from analyzer.engine import AnalysisEngine
 from analyzer.rule_evaluator import RuleEvaluator
 from analyzer.llm_evaluator import LLMEvaluator
@@ -21,16 +22,19 @@ def run(config: AnalyzerConfig) -> None:
     updater = DBUpdater()
     nginx = NginxBlocklist()
     reporter = ReportWriter(config.report_file_path)
+    reputation = IpReputation()
     engine = AnalysisEngine(
         [
             RuleEvaluator(
                 confirm_threshold=config.confirm_confidence_threshold,
                 dismiss_threshold=config.dismiss_confidence_threshold,
+                reputation=reputation,
             ),
             LLMEvaluator(
                 region=config.aws_region,
                 model_id=config.bedrock_model_id,
                 max_tokens=config.llm_max_tokens,
+                reputation=reputation,
             ),
         ]
     )
@@ -62,6 +66,10 @@ def run(config: AnalyzerConfig) -> None:
             updater.apply(decision, record.user_identity)
             nginx.apply(decision, record)
             reporter.write(record, decision)
+            # A fresh confirmation changes this IP's reputation immediately —
+            # drop the cached entry so the next verdict sees the update.
+            if decision.decision == "CONFIRM":
+                reputation.invalidate(record.source_ip)
 
         time.sleep(config.poll_interval_seconds)
 
@@ -69,4 +77,5 @@ def run(config: AnalyzerConfig) -> None:
     updater.close()
     nginx.close()
     reporter.close()
+    reputation.close()
     logger.info("Analyzer stopped.")

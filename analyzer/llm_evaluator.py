@@ -10,12 +10,20 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from models import AnalysisDecision, VerdictRecord
 from analyzer.base import BaseEvaluator
+from ingestion.ip_reputation import IpReputation
 
 logger = logging.getLogger(__name__)
+
+# Hard attack reasons that justify a network-layer IP block on confirm.
+_HIGH_SEVERITY = frozenset({
+    "sql_injection", "scanner_detected", "brute_force", "credential_stuffing",
+})
 
 _SYSTEM_PROMPT = (
     "You are a security analyst reviewing fraud verdicts from an automated classifier. "
     "Your task: CONFIRM (real attack — block the user) or DISMISS (false positive — leave unblocked). "
+    "Weigh the source IP's recent history heavily: a single 404 may look benign, but the same IP "
+    "probing many endpoints in a short window is reconnaissance and should be CONFIRMED. "
     "Respond with a JSON object only, no other text:\n"
     '{"decision": "CONFIRM" or "DISMISS", "reasoning": "one sentence"}'
 )
@@ -28,6 +36,7 @@ Verdict to review:
 - Path: {path}
 - Confidence score: {confidence_score:.2f}
 - Classifier reasons: {reason}
+- Source IP recent history: {reputation}
 - Original request log: {original_log}
 
 Should this verdict be CONFIRMED (block user) or DISMISSED (false positive)?"""
@@ -39,9 +48,11 @@ class LLMEvaluator(BaseEvaluator):
         region: str = "us-east-1",
         model_id: str = "amazon.nova-lite-v1:0",
         max_tokens: int = 512,
+        reputation: Optional[IpReputation] = None,
     ) -> None:
         self._model_id = model_id
         self._max_tokens = max_tokens
+        self._reputation = reputation
         try:
             self._client = boto3.client("bedrock-runtime", region_name=region)
             logger.info("LLMEvaluator ready: model=%s region=%s", model_id, region)
@@ -50,8 +61,15 @@ class LLMEvaluator(BaseEvaluator):
             self._client = None
 
     def evaluate(self, record: VerdictRecord) -> Optional[AnalysisDecision]:
+        reasons = {r.strip() for r in record.reason.split(",") if r.strip()}
+        rep = self._reputation.lookup(record.source_ip) if self._reputation else None
+        # A confirmed verdict warrants a hard IP block when a hard attack reason
+        # is present, or the IP is a known repeat offender.
+        enforce = bool(reasons & _HIGH_SEVERITY) or (rep.is_repeat_offender if rep else False)
+        rep_text = rep.summary_line() if rep else "no history available"
+
         if self._client is None:
-            return self._fallback(record.id, "Bedrock client unavailable")
+            return self._fallback(record.id, "Bedrock client unavailable", enforce)
 
         prompt = _USER_PROMPT_TEMPLATE.format(
             source_ip=record.source_ip,
@@ -60,6 +78,7 @@ class LLMEvaluator(BaseEvaluator):
             path=record.path,
             confidence_score=record.confidence_score,
             reason=record.reason,
+            reputation=rep_text,
             original_log=record.original_log_entry_reference[:500],
         )
 
@@ -72,15 +91,15 @@ class LLMEvaluator(BaseEvaluator):
             )
             text = response["output"]["message"]["content"][0]["text"].strip()
             logger.debug("LLMEvaluator raw response: %r", text[:300])
-            return self._parse_response(record.id, text)
+            return self._parse_response(record.id, text, enforce)
         except (BotoCoreError, ClientError) as exc:
             logger.error("LLMEvaluator Bedrock call failed for verdict_id=%d: %s", record.id, exc)
-            return self._fallback(record.id, f"Bedrock error: {exc}")
+            return self._fallback(record.id, f"Bedrock error: {exc}", enforce)
         except Exception as exc:
             logger.error("LLMEvaluator unexpected error for verdict_id=%d: %s", record.id, exc)
-            return self._fallback(record.id, f"Unexpected error: {exc}")
+            return self._fallback(record.id, f"Unexpected error: {exc}", enforce)
 
-    def _parse_response(self, verdict_id: int, text: str) -> AnalysisDecision:
+    def _parse_response(self, verdict_id: int, text: str, enforce: bool) -> AnalysisDecision:
         now = datetime.now(tz=timezone.utc).isoformat()
         try:
             clean = text.strip()
@@ -99,6 +118,7 @@ class LLMEvaluator(BaseEvaluator):
                 decision=decision,
                 reasoning=f"[LLM] {reasoning}",
                 analyzed_at=now,
+                enforce_ip_block=enforce if decision == "CONFIRM" else False,
             )
         except (json.JSONDecodeError, ValueError, KeyError) as exc:
             logger.warning(
@@ -110,13 +130,15 @@ class LLMEvaluator(BaseEvaluator):
                 decision="CONFIRM",
                 reasoning=f"[LLM fallback] Parse error ({exc}) — defaulting to CONFIRM",
                 analyzed_at=now,
+                enforce_ip_block=enforce,
             )
 
-    def _fallback(self, verdict_id: int, reason: str) -> AnalysisDecision:
+    def _fallback(self, verdict_id: int, reason: str, enforce: bool = False) -> AnalysisDecision:
         now = datetime.now(tz=timezone.utc).isoformat()
         return AnalysisDecision(
             verdict_id=verdict_id,
             decision="CONFIRM",
             reasoning=f"[LLM fallback] {reason} — defaulting to CONFIRM",
             analyzed_at=now,
+            enforce_ip_block=enforce,
         )

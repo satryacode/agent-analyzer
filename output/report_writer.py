@@ -21,7 +21,12 @@ class ReportWriter:
 
     def write(self, record: VerdictRecord, decision: AnalysisDecision) -> None:
         if decision.decision == "CONFIRM":
-            action = "user_blocked" if record.user_identity else "flagged_no_user"
+            parts = []
+            if record.user_identity:
+                parts.append("user_blocked")
+            if decision.enforce_ip_block:
+                parts.append("ip_blocked")
+            action = "+".join(parts) if parts else "flagged"
         else:
             action = "dismissed"
 

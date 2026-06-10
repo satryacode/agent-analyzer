@@ -14,12 +14,6 @@ logger = logging.getLogger(__name__)
 
 _BLOCKED_IPS_PATH = os.environ.get("NGINX_BLOCKED_IPS_PATH", "/etc/nginx/blocked_ips.conf")
 
-# Only these reasons justify a hard IP block at the network layer
-_HIGH_SEVERITY = frozenset({
-    "sql_injection", "scanner_detected",
-    "brute_force", "credential_stuffing",
-})
-
 _INSERT_SQL = """
     INSERT INTO blocked_ips (source_ip, verdict_id, reason)
     VALUES (%s, %s, %s)
@@ -57,8 +51,12 @@ class NginxBlocklist:
             self._conn = None
 
     def apply(self, decision: AnalysisDecision, record: VerdictRecord) -> None:
-        if decision.decision != "CONFIRM" or record.user_identity:
-            return  # only handle confirmed + no user_identity cases
+        # Policy lives in the evaluator: it decides whether a confirmation
+        # warrants a hard network-layer block (enforce_ip_block). The IP block
+        # and any user block are independent — an attacker supplying a username
+        # (even a SQL-injection payload as the username) must not escape the ban.
+        if decision.decision != "CONFIRM" or not decision.enforce_ip_block:
+            return
 
         try:
             addr = ipaddress.ip_address(record.source_ip)
@@ -67,14 +65,6 @@ class NginxBlocklist:
                 return
         except ValueError:
             pass
-
-        reasons = {r.strip() for r in record.reason.split(",") if r.strip()}
-        if not reasons & _HIGH_SEVERITY:
-            logger.info(
-                "NginxBlocklist: skipping IP block for %s — no high-severity reason (got: %s)",
-                record.source_ip, record.reason,
-            )
-            return
 
         self._insert_db(record)
         self._write_nginx_deny(record.source_ip)

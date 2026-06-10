@@ -23,6 +23,9 @@ class AnalysisDecision:
     decision: str  # "CONFIRM" or "DISMISS"
     reasoning: str
     analyzed_at: str
+    # Whether this confirmation warrants a hard network-layer IP block.
+    # The evaluator (policy) decides; NginxBlocklist (actuator) just obeys.
+    enforce_ip_block: bool = False
 
 
 @dataclass
